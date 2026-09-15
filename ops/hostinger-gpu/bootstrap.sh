@@ -37,7 +37,12 @@ if [ ! -f .env.hostinger ]; then
 fi
 
 echo "Checking NVIDIA runtime from Docker..."
-docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+# Hostinger shared GPU workers inject HAIShare libraries that require glibc >= 2.38.
+# Ubuntu 22.04 CUDA test images use an older glibc and fail even when the GPU is
+# correctly attached. Test with Debian Trixie instead, which is compatible with
+# the injected Hostinger runtime and matches the production Voicebox base image.
+docker run --rm --gpus all python:3.12-slim-trixie \
+  nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 
 echo "Building and starting Swade Voice Engine..."
 docker compose -f docker-compose.hostinger-nvidia.yml --env-file .env.hostinger up -d --build
