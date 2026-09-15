@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR=${GPU_CONTROLLER_STATE_DIR:-/opt/swade-gpu-controller}
+STATE_FILE="$STATE_DIR/worker.env"
+SSH_KEY=${GPU_SSH_KEY:-/root/.ssh/id_ed25519}
+REMOTE_USER=${GPU_REMOTE_USER:-root}
+BRANCH=${GPU_VOICE_BRANCH:-hostinger-nvidia-voice-engine}
+REPO_URL=${GPU_VOICE_REPO:-https://github.com/swadesoul/voiceboxsoul.git}
+REMOTE_APP_DIR=${GPU_REMOTE_APP_DIR:-/opt/voiceboxsoul}
+REMOTE_VOICE_ROOT=${GPU_REMOTE_VOICE_ROOT:-/opt/swade-voice}
+GATEWAY_PORT=${GPU_GATEWAY_PORT:-17601}
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+usage() {
+  cat <<'EOF'
+Swade GPU Controller
+
+Usage:
+  gpuctl register <gpu-ip-or-hostname>
+  gpuctl status
+  gpuctl provision
+  gpuctl health
+  gpuctl drain
+  gpuctl safe-to-destroy
+  gpuctl clear
+
+Lifecycle:
+  1) Deploy a Hostinger GPU manually.
+  2) gpuctl register <ip>
+  3) gpuctl provision
+  4) Use the GPU for voice jobs.
+  5) gpuctl drain
+  6) gpuctl safe-to-destroy
+  7) Destroy the GPU in Hostinger only after SAFE_TO_DESTROY=YES.
+  8) gpuctl clear
+EOF
+}
+
+load_state() {
+  if [ ! -f "$STATE_FILE" ]; then
+    echo "No GPU worker is registered. Run: gpuctl register <gpu-ip-or-hostname>" >&2
+    exit 2
+  fi
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  : "${GPU_HOST:?GPU_HOST missing from state}"
+}
+
+ssh_opts=(
+  -i "$SSH_KEY"
+  -o BatchMode=yes
+  -o ConnectTimeout=12
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=2
+  -o StrictHostKeyChecking=accept-new
+)
+
+remote() {
+  load_state
+  ssh "${ssh_opts[@]}" "${REMOTE_USER}@${GPU_HOST}" "$@"
+}
+
+case "${1:-}" in
+  register)
+    host=${2:-}
+    if [ -z "$host" ]; then
+      echo "Missing GPU IP/hostname." >&2
+      exit 2
+    fi
+    if ! [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+      echo "Invalid GPU host format." >&2
+      exit 2
+    fi
+    cat > "$STATE_FILE" <<EOF
+GPU_HOST=$host
+REGISTERED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+    chmod 600 "$STATE_FILE"
+    echo "Registered GPU worker: $host"
+    echo "Next: gpuctl provision"
+    ;;
+
+  status)
+    load_state
+    echo "Registered GPU: $GPU_HOST"
+    echo "Registered at: ${REGISTERED_AT:-unknown}"
+    if remote 'true' >/dev/null 2>&1; then
+      echo "SSH: reachable"
+      remote 'printf "Host: "; hostname; printf "IP: "; hostname -I; printf "GPU: "; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "not detected"; printf "Docker: "; docker --version 2>/dev/null || echo "not installed"'
+    else
+      echo "SSH: unreachable"
+      exit 1
+    fi
+    ;;
+
+  provision)
+    load_state
+    echo "Provisioning $GPU_HOST ..."
+    remote "bash -s" <<EOF
+set -euo pipefail
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo 'ERROR: nvidia-smi not found. This is not ready as a Hostinger NVIDIA GPU worker.' >&2
+  exit 10
+fi
+nvidia-smi
+if ! command -v git >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y git curl ca-certificates openssl
+fi
+if ! command -v docker >/dev/null 2>&1; then
+  echo 'ERROR: Docker is not installed on this GPU image.' >&2
+  exit 11
+fi
+mkdir -p '$REMOTE_VOICE_ROOT/data' '$REMOTE_VOICE_ROOT/output' '$REMOTE_VOICE_ROOT/hf-cache'
+if [ ! -d '$REMOTE_APP_DIR/.git' ]; then
+  git clone --branch '$BRANCH' '$REPO_URL' '$REMOTE_APP_DIR'
+else
+  git -C '$REMOTE_APP_DIR' fetch origin '$BRANCH'
+  git -C '$REMOTE_APP_DIR' checkout '$BRANCH'
+  git -C '$REMOTE_APP_DIR' pull --ff-only origin '$BRANCH'
+fi
+cd '$REMOTE_APP_DIR'
+VOICE_ENGINE_ROOT='$REMOTE_VOICE_ROOT' APP_DIR='$REMOTE_APP_DIR' BRANCH='$BRANCH' bash ops/hostinger-gpu/bootstrap.sh
+EOF
+    echo "Provisioning complete."
+    echo "Next: gpuctl health"
+    ;;
+
+  health)
+    load_state
+    remote "set -e; curl -fsS http://127.0.0.1:${GATEWAY_PORT}/health; echo; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader"
+    ;;
+
+  drain)
+    load_state
+    echo "Draining GPU worker before destruction..."
+    remote "bash -s" <<'EOF'
+set -euo pipefail
+cd /opt/voiceboxsoul
+if docker compose -f docker-compose.hostinger-nvidia.yml --env-file .env.hostinger ps --status running | grep -q swade-voicebox; then
+  echo 'Voice Engine container is running.'
+fi
+# Stop accepting new public work first.
+docker compose -f docker-compose.hostinger-nvidia.yml --env-file .env.hostinger stop gateway || true
+# Allow existing local work a short grace period.
+sleep 5
+# Back up before stopping inference.
+if [ -x ops/hostinger-gpu/backup-to-b2.sh ]; then
+  if [ -f /root/.config/swade-voice-b2.env ]; then
+    set -a
+    . /root/.config/swade-voice-b2.env
+    set +a
+    ops/hostinger-gpu/backup-to-b2.sh
+  else
+    echo 'WARNING: /root/.config/swade-voice-b2.env not found; B2 backup could not run.' >&2
+    exit 30
+  fi
+else
+  echo 'ERROR: backup-to-b2.sh missing.' >&2
+  exit 31
+fi
+# Stop inference only after backup succeeds.
+docker compose -f docker-compose.hostinger-nvidia.yml --env-file .env.hostinger stop voicebox
+mkdir -p /opt/swade-voice
+printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /opt/swade-voice/.last-safe-drain
+printf '%s\n' 'BACKUP_VERIFIED=YES' >> /opt/swade-voice/.last-safe-drain
+echo 'Drain completed.'
+EOF
+    echo "Drain completed. Run: gpuctl safe-to-destroy"
+    ;;
+
+  safe-to-destroy)
+    load_state
+    remote "bash -s" <<'EOF'
+set -euo pipefail
+marker=/opt/swade-voice/.last-safe-drain
+if [ ! -f "$marker" ]; then
+  echo 'SAFE_TO_DESTROY=NO'
+  echo 'Reason: no successful drain marker found.'
+  exit 40
+fi
+if ! grep -q '^BACKUP_VERIFIED=YES$' "$marker"; then
+  echo 'SAFE_TO_DESTROY=NO'
+  echo 'Reason: backup verification marker missing.'
+  exit 41
+fi
+if docker ps --format '{{.Names}}' | grep -Eq '^(swade-voicebox|swade-voice-gateway)$'; then
+  echo 'SAFE_TO_DESTROY=NO'
+  echo 'Reason: Voice Engine containers are still running.'
+  exit 42
+fi
+echo 'SAFE_TO_DESTROY=YES'
+echo 'The GPU can now be destroyed manually in Hostinger.'
+EOF
+    ;;
+
+  clear)
+    if [ -f "$STATE_FILE" ]; then
+      rm -f "$STATE_FILE"
+    fi
+    echo "Cleared registered GPU worker state."
+    ;;
+
+  -h|--help|help|'')
+    usage
+    ;;
+
+  *)
+    echo "Unknown command: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
