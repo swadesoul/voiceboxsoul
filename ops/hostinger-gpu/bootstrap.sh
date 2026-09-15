@@ -51,12 +51,12 @@ echo "Waiting for health endpoint..."
 for i in $(seq 1 60); do
   if curl -fsS http://127.0.0.1:17601/health >/dev/null; then
     echo "Voice Engine is healthy."
-    docker compose -f docker-compose.hostinger-nvidia.yml ps
+    docker compose -f docker-compose.hostinger-nvidia.yml --env-file .env.hostinger ps
     exit 0
   fi
   sleep 5
 done
 
 echo "ERROR: Voice Engine did not become healthy."
-docker compose -f docker-compose.hostinger-nvidia.yml logs --tail=200
+docker compose -f docker-compose.hostinger-nvidia.yml --env-file .env.hostinger logs --tail=200
 exit 1
