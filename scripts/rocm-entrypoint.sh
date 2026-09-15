@@ -1,7 +1,28 @@
 #!/bin/sh
 set -e
-# Join whatever groups own the mounted GPU nodes so /dev/kfd and /dev/dri work
-# on any host (no RENDER_GID/VIDEO_GID needed), then drop to the app user.
+
+# Prepare persistent bind-mounted directories before dropping privileges.
+# Hostinger/VPS creates these host paths as root, while the application runs
+# as the non-root `voicebox` user. Without this, SQLite cannot create
+# /app/data/voicebox.db and startup fails with "unable to open database file".
+mkdir -p \
+    /app/data \
+    /app/data/generations \
+    /app/data/profiles \
+    /app/data/cache \
+    /home/voicebox/.cache/huggingface
+
+chown voicebox:voicebox \
+    /app/data \
+    /app/data/generations \
+    /app/data/profiles \
+    /app/data/cache \
+    /home/voicebox/.cache \
+    /home/voicebox/.cache/huggingface
+
+# Join whatever groups own GPU device nodes, then drop to the app user.
+# AMD/ROCm nodes are handled when present; NVIDIA access is normally supplied
+# by Docker's GPU runtime and does not require these device groups.
 for dev in /dev/kfd /dev/dri/render*; do
     [ -e "$dev" ] || continue
     gid=$(stat -c %g "$dev")
@@ -12,4 +33,5 @@ for dev in /dev/kfd /dev/dri/render*; do
     }
     usermod -aG "$grp" voicebox
 done
+
 exec gosu voicebox "$@"

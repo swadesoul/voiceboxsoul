@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR=${GPU_CONTROLLER_STATE_DIR:-/opt/swade-gpu-controller}
+STATE_FILE="$STATE_DIR/worker.env"
+SSH_KEY=${GPU_SSH_KEY:-/root/.ssh/swade_gpu_controller_ed25519}
+BRANCH=${GPU_VOICE_BRANCH:-hostinger-nvidia-voice-engine}
+REPO_URL=${GPU_VOICE_REPO:-https://github.com/swadesoul/voiceboxsoul.git}
+REMOTE_APP_DIR=${GPU_REMOTE_APP_DIR:-/opt/voiceboxsoul}
+REMOTE_VOICE_ROOT=${GPU_REMOTE_VOICE_ROOT:-/opt/swade-voice}
+GATEWAY_PORT=${GPU_GATEWAY_PORT:-17601}
+LOCAL_ARCHIVE_ROOT=${GPU_LOCAL_ARCHIVE_ROOT:-/opt/swade-gpu-archive}
+
+mkdir -p "$STATE_DIR" "$LOCAL_ARCHIVE_ROOT"
+chmod 700 "$STATE_DIR" "$LOCAL_ARCHIVE_ROOT"
+
+usage() {
+  cat <<'EOF'
+Swade GPU Controller
+
+Usage:
+  gpuctl register <gpu-ip-or-hostname> [ssh-port] [ssh-user]
+  gpuctl authorize
+  gpuctl status
+  gpuctl provision
+  gpuctl health
+  gpuctl drain
+  gpuctl safe-to-destroy
+  gpuctl clear
+
+Hostinger GPU example:
+  gpuctl register 4.71.129.67 32611 ubuntu
+  gpuctl authorize
+  gpuctl status
+  gpuctl provision
+
+Lifecycle:
+  1) Deploy a Hostinger GPU manually.
+  2) gpuctl register <ip> <port> <user>
+  3) gpuctl authorize          # one-time SSH key install; prompts for Hostinger password locally
+  4) gpuctl provision
+  5) Use the GPU for voice jobs.
+  6) gpuctl drain
+  7) gpuctl safe-to-destroy
+  8) Destroy the GPU in Hostinger only after SAFE_TO_DESTROY=YES.
+  9) gpuctl clear
+EOF
+}
+
+load_state() {
+  if [ ! -f "$STATE_FILE" ]; then
+    echo "No GPU worker is registered. Run: gpuctl register <gpu-ip-or-hostname> [port] [user]" >&2
+    exit 2
+  fi
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  : "${GPU_HOST:?GPU_HOST missing from state}"
+  GPU_PORT=${GPU_PORT:-22}
+  GPU_USER=${GPU_USER:-root}
+}
+
+ssh_base() {
+  load_state
+  SSH_OPTS=(
+    -i "$SSH_KEY"
+    -p "$GPU_PORT"
+    -o BatchMode=yes
+    -o ConnectTimeout=12
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=2
+    -o StrictHostKeyChecking=accept-new
+  )
+}
+
+remote() {
+  ssh_base
+  ssh "${SSH_OPTS[@]}" "${GPU_USER}@${GPU_HOST}" "$@"
+}
+
+remote_root() {
+  ssh_base
+  if [ "$GPU_USER" = "root" ]; then
+    ssh "${SSH_OPTS[@]}" "${GPU_USER}@${GPU_HOST}" "$@"
+  else
+    ssh "${SSH_OPTS[@]}" "${GPU_USER}@${GPU_HOST}" sudo -n "$@"
+  fi
+}
+
+case "${1:-}" in
+  register)
+    host=${2:-}
+    port=${3:-22}
+    user=${4:-root}
+    if [ -z "$host" ]; then
+      echo "Missing GPU IP/hostname." >&2
+      exit 2
+    fi
+    if ! [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+      echo "Invalid GPU host format." >&2
+      exit 2
+    fi
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+      echo "Invalid SSH port." >&2
+      exit 2
+    fi
+    if ! [[ "$user" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "Invalid SSH username." >&2
+      exit 2
+    fi
+    cat > "$STATE_FILE" <<EOF
+GPU_HOST=$host
+GPU_PORT=$port
+GPU_USER=$user
+REGISTERED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+    chmod 600 "$STATE_FILE"
+    echo "Registered GPU worker: $user@$host:$port"
+    echo "Next: gpuctl authorize"
+    ;;
+
+  authorize)
+    load_state
+    if [ ! -f "$SSH_KEY" ]; then
+      install -d -m 700 "$(dirname "$SSH_KEY")"
+      ssh-keygen -t ed25519 -N '' -f "$SSH_KEY" -C 'swade-gpu-controller'
+      chmod 600 "$SSH_KEY"
+      chmod 644 "$SSH_KEY.pub"
+    fi
+    if ! command -v ssh-copy-id >/dev/null 2>&1; then
+      echo "ERROR: ssh-copy-id is required (package: openssh-client)." >&2
+      exit 3
+    fi
+    echo "Installing the controller public key on $GPU_USER@$GPU_HOST:$GPU_PORT."
+    echo "Hostinger will prompt for the GPU password here. Do not paste that password into chat."
+    ssh-copy-id -i "$SSH_KEY.pub" -p "$GPU_PORT" -o StrictHostKeyChecking=accept-new "$GPU_USER@$GPU_HOST"
+    echo "Testing key-only SSH..."
+    if remote 'true'; then
+      echo "SSH authorization successful."
+      if [ "$GPU_USER" != "root" ]; then
+        if remote 'sudo -n true' >/dev/null 2>&1; then
+          echo "Passwordless sudo: available"
+        else
+          echo "ERROR: passwordless sudo is not available for $GPU_USER; automated provisioning cannot continue safely." >&2
+          exit 4
+        fi
+      fi
+    fi
+    ;;
+
+  status)
+    load_state
+    echo "Registered GPU: $GPU_USER@$GPU_HOST:$GPU_PORT"
+    echo "Registered at: ${REGISTERED_AT:-unknown}"
+    if remote 'true' >/dev/null 2>&1; then
+      echo "SSH: reachable"
+      remote 'printf "Host: "; hostname; printf "IP: "; hostname -I; printf "GPU: "; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "not detected"; printf "Docker: "; (docker --version 2>/dev/null || sudo -n docker --version 2>/dev/null || echo "not installed")'
+    else
+      echo "SSH: unreachable or SSH key not authorized"
+      exit 1
+    fi
+    ;;
+
+  provision)
+    load_state
+    echo "Provisioning $GPU_USER@$GPU_HOST:$GPU_PORT ..."
+    remote_root "bash -s" <<EOF
+set -euo pipefail
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo 'ERROR: nvidia-smi not found. This is not ready as a Hostinger NVIDIA GPU worker.' >&2
+  exit 10
+fi
+nvidia-smi
+if ! command -v git >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y git curl ca-certificates openssl rsync
+fi
+if ! command -v docker >/dev/null 2>&1; then
+  echo 'ERROR: Docker is not installed on this GPU image.' >&2
+  exit 11
+fi
+if ! docker compose version >/dev/null 2>&1; then
+  echo 'ERROR: Docker Compose v2 is not installed on this GPU image.' >&2
+  exit 12
+fi
+mkdir -p '$REMOTE_VOICE_ROOT/data' '$REMOTE_VOICE_ROOT/output' '$REMOTE_VOICE_ROOT/hf-cache'
+if [ ! -d '$REMOTE_APP_DIR/.git' ]; then
+  git clone --branch '$BRANCH' '$REPO_URL' '$REMOTE_APP_DIR'
+else
+  git -C '$REMOTE_APP_DIR' fetch origin '$BRANCH'
+  git -C '$REMOTE_APP_DIR' checkout '$BRANCH'
+  git -C '$REMOTE_APP_DIR' pull --ff-only origin '$BRANCH'
+fi
+cd '$REMOTE_APP_DIR'
+VOICE_ENGINE_ROOT='$REMOTE_VOICE_ROOT' APP_DIR='$REMOTE_APP_DIR' BRANCH='$BRANCH' bash ops/hostinger-gpu/bootstrap.sh
+EOF
+    echo "Provisioning complete."
+    echo "Next: gpuctl health"
+    ;;
+
+  health)
+    load_state
+    remote_root "bash -lc 'set -e; curl -fsS http://127.0.0.1:${GATEWAY_PORT}/health; echo; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader'"
+    ;;
+
+  drain)
+    load_state
+    echo "Draining GPU worker before destruction..."
+    remote_root "bash -s" <<'EOF'
+set -euo pipefail
+cd /opt/voiceboxsoul
+# Stop new external requests first.
+docker compose -f docker-compose.hostinger-nvidia.yml --env-file .env.hostinger stop gateway || true
+# Give an active local generation a short grace period, then stop inference to
+# make the SQLite DB and profile state consistent for transfer.
+sleep 5
+docker compose -f docker-compose.hostinger-nvidia.yml --env-file .env.hostinger stop voicebox || true
+EOF
+
+    ssh_base
+    worker_dir="$LOCAL_ARCHIVE_ROOT/current"
+    mkdir -p "$worker_dir"
+    echo "Copying persistent voice state from GPU to permanent VPS..."
+    rsync -a --delete -e "ssh -i '$SSH_KEY' -p '$GPU_PORT' -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
+      "${GPU_USER}@${GPU_HOST}:${REMOTE_VOICE_ROOT}/data/" "$worker_dir/data/"
+    rsync -a --delete -e "ssh -i '$SSH_KEY' -p '$GPU_PORT' -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
+      "${GPU_USER}@${GPU_HOST}:${REMOTE_VOICE_ROOT}/output/" "$worker_dir/output/"
+
+    stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    printf '%s\n' "$stamp" > "$LOCAL_ARCHIVE_ROOT/.last-safe-drain"
+    printf '%s\n' "GPU_HOST=$GPU_HOST" >> "$LOCAL_ARCHIVE_ROOT/.last-safe-drain"
+    printf '%s\n' 'VPS_COPY_VERIFIED=YES' >> "$LOCAL_ARCHIVE_ROOT/.last-safe-drain"
+
+    # Optional second copy to Backblaze when the permanent VPS has already
+    # been configured with rclone + /root/.config/swade-voice-b2.env.
+    if [ -f /root/.config/swade-voice-b2.env ] && command -v rclone >/dev/null 2>&1; then
+      set -a
+      # shellcheck disable=SC1091
+      . /root/.config/swade-voice-b2.env
+      set +a
+      VOICE_ENGINE_ROOT="$worker_dir" /opt/voiceboxsoul/ops/hostinger-gpu/backup-to-b2.sh
+      printf '%s\n' 'B2_BACKUP_VERIFIED=YES' >> "$LOCAL_ARCHIVE_ROOT/.last-safe-drain"
+      echo "Backblaze B2 backup verified."
+    else
+      printf '%s\n' 'B2_BACKUP_VERIFIED=NO' >> "$LOCAL_ARCHIVE_ROOT/.last-safe-drain"
+      echo "WARNING: Backblaze is not configured on the permanent VPS yet. The verified VPS copy is complete."
+    fi
+
+    echo "Drain completed. Run: gpuctl safe-to-destroy"
+    ;;
+
+  safe-to-destroy)
+    load_state
+    marker="$LOCAL_ARCHIVE_ROOT/.last-safe-drain"
+    if [ ! -f "$marker" ]; then
+      echo 'SAFE_TO_DESTROY=NO'
+      echo 'Reason: no successful drain marker found on permanent VPS.'
+      exit 40
+    fi
+    if ! grep -q '^VPS_COPY_VERIFIED=YES$' "$marker"; then
+      echo 'SAFE_TO_DESTROY=NO'
+      echo 'Reason: permanent VPS copy verification marker missing.'
+      exit 41
+    fi
+    if ! grep -q "^GPU_HOST=$GPU_HOST$" "$marker"; then
+      echo 'SAFE_TO_DESTROY=NO'
+      echo 'Reason: last verified drain belongs to a different GPU worker.'
+      exit 42
+    fi
+    if remote_root "docker ps --format '{{.Names}}' | grep -Eq '^(swade-voicebox|swade-voice-gateway)$'" >/dev/null 2>&1; then
+      echo 'SAFE_TO_DESTROY=NO'
+      echo 'Reason: Voice Engine containers are still running.'
+      exit 43
+    fi
+    echo 'SAFE_TO_DESTROY=YES'
+    if grep -q '^B2_BACKUP_VERIFIED=YES$' "$marker"; then
+      echo 'Protection: permanent VPS copy + Backblaze B2 backup verified.'
+    else
+      echo 'Protection: permanent VPS copy verified; Backblaze B2 was not configured for this drain.'
+    fi
+    echo 'The GPU can now be destroyed manually in Hostinger.'
+    ;;
+
+  clear)
+    if [ -f "$STATE_FILE" ]; then
+      rm -f "$STATE_FILE"
+    fi
+    echo "Cleared registered GPU worker state."
+    ;;
+
+  -h|--help|help|'')
+    usage
+    ;;
+
+  *)
+    echo "Unknown command: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

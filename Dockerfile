@@ -5,6 +5,10 @@
 # Build variants:
 #   CPU (default):  docker compose up --build
 #   ROCm (AMD GPU): docker compose -f docker-compose.yml -f docker-compose.rocm.yml up --build
+#
+# Hostinger shared GPU instances inject a HAIShare runtime library into nested
+# containers. That library requires glibc >= 2.38, so use Debian Trixie here
+# rather than Bookworm-era images.
 # ============================================================
 
 # Top-level ARG so it is visible to all stages.
@@ -32,7 +36,7 @@ RUN cd web && bunx --bun vite build
 
 
 # === Stage 2: Build Python dependencies ===
-FROM python:3.11-slim AS backend-builder
+FROM python:3.12-slim-trixie AS backend-builder
 
 # Re-declare ARG inside the stage (Docker scoping requirement).
 ARG PYTORCH_VARIANT=cpu
@@ -68,7 +72,7 @@ RUN pip install --no-cache-dir --prefix=/install \
 
 
 # === Stage 3: Runtime ===
-FROM python:3.11-slim
+FROM python:3.12-slim-trixie
 
 # Create non-root user; the entrypoint joins GPU device groups at runtime.
 RUN groupadd -r voicebox && \

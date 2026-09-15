@@ -1,0 +1,55 @@
+# Hostinger NVIDIA GPU production stack for Swade Voice Engine
+#
+# Run with:
+#   docker compose -f docker-compose.hostinger-nvidia.yml --env-file .env.hostinger up -d --build
+#
+# Expose ONLY port 17601 through Hostinger hPanel. Do not expose 17493.
+
+services:
+  voicebox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: swade-voicebox
+    restart: unless-stopped
+    gpus: all
+    shm_size: "2gb"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NUMBA_CACHE_DIR: /app/data/cache/numba
+      HF_HOME: /home/voicebox/.cache/huggingface
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      VOICEBOX_CORS_ORIGINS: ${VOICEBOX_CORS_ORIGINS:-}
+    volumes:
+      - ${VOICE_ENGINE_ROOT:-/opt/swade-voice}/data:/app/data
+      - ${VOICE_ENGINE_ROOT:-/opt/swade-voice}/output:/app/data/generations
+      - ${VOICE_ENGINE_ROOT:-/opt/swade-voice}/hf-cache:/home/voicebox/.cache/huggingface
+    networks:
+      - voice-internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:17493/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: swade-voice-gateway
+    restart: unless-stopped
+    depends_on:
+      voicebox:
+        condition: service_healthy
+    environment:
+      VOICEBOX_API_TOKEN: ${VOICEBOX_API_TOKEN:?VOICEBOX_API_TOKEN is required}
+    ports:
+      - "17601:17601"
+    volumes:
+      - ./ops/hostinger-gpu/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    networks:
+      - voice-internal
+
+networks:
+  voice-internal:
+    driver: bridge
