@@ -1,0 +1,22 @@
+# SWADE Voice Engine — RunPod serverless worker image.
+#
+# Everything the worker needs is baked in at build time, so a cold start downloads nothing
+# from swadebase.cloud or GitHub. The base is pinned by digest, not "latest", so a rebuild
+# never silently changes engines. To upgrade Voicebox: update BASE_IMAGE's digest, push a new
+# runpod-v* tag, then point the RunPod template at the new tag (the old tag is the rollback).
+#
+# Base: ghcr.io/jamiepine/voicebox:latest-cuda as of 2026-10-17.
+ARG BASE_IMAGE=ghcr.io/jamiepine/voicebox@sha256:7d4e8af611554bc59d80c72b18fdd71680f69197fe29b9ff9b33c0e7b1522a29
+FROM ${BASE_IMAGE}
+
+USER root
+RUN pip install --no-cache-dir --root-user-action=ignore runpod==1.12.0 requests==2.32.3
+
+COPY ops/runpod/handler.py /app/runpod_handler.py
+
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+ENTRYPOINT []
+CMD ["python", "-u", "/app/runpod_handler.py"]
