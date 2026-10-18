@@ -8,13 +8,14 @@ Job input:
   {"op": "health"}
   {"op": "raw", "method": "GET", "path": "/models/status", "json": {...}}          # admin/debug
   {"op": "transcribe", "audio_url": "..."}
+  {"op": "preload", "models": ["chatterbox-turbo", "qwen-tts-1.7B", "whisper-base"]}   # once per new volume
   {"op": "speak", "text": "...", "engine": "chatterbox_turbo", "language": "en", "instruct": "...",
    "profile": {"key": "unique-stable-key", "name": "Display name", "language": "en",
                "samples": [{"url": "https://signed-url", "text": "optional transcript"}]},
    "upload_url": "https://signed-PUT-url (optional)", "format": "mp3"}
 No secrets are stored here; sample and upload URLs are short-lived signed URLs supplied per job.
 """
-import base64, json, os, subprocess, sys, tempfile, time, urllib.request
+import base64, hashlib, json, os, shutil, subprocess, sys, tempfile, time, urllib.request
 
 import requests
 import runpod
@@ -95,8 +96,11 @@ def transcribe(path):
 
 
 def ensure_profile(p):
-    key = p["key"]
-    name = f"{p.get('name') or 'voice'} [{key}]"[:100]
+    key = str(p["key"])
+    if len(key) > 40:  # keep the identity intact inside Voicebox's 100-character name limit
+        key = hashlib.sha256(key.encode()).hexdigest()[:24]
+    label = (p.get("name") or "voice")[: 100 - len(key) - 3]
+    name = f"{label} [{key}]"
     for existing in requests.get(f"{BASE}/profiles", timeout=30).json():
         if existing.get("name") == name:
             return existing["id"], None
@@ -118,6 +122,8 @@ def ensure_profile(p):
                                          data={"reference_text": text[:1000]}, timeout=900)
             call_wait(add, "add sample")
             texts.append({"url_path": s["url"].split("?")[0][-160:], "text": text[:1000]})
+        if p.get("samples") and not texts:
+            raise RuntimeError("no usable voice sample: every sample was silent or had no transcript")
     except Exception:
         requests.delete(f"{BASE}/profiles/{pid}", timeout=30)
         raise
@@ -167,11 +173,40 @@ def speak(inp):
     return result
 
 
+DEFAULT_PRELOAD = ["chatterbox-turbo", "qwen-tts-1.7B", "whisper-base"]
+
+
+def preload(inp, budget=1700):
+    """Download models into the volume's Hugging Face cache once, so later cold starts only load them."""
+    wanted = [str(m) for m in (inp.get("models") or DEFAULT_PRELOAD)]
+    for m in wanted:
+        r = requests.post(f"{BASE}/models/download", json={"model_name": m}, timeout=60)
+        if not r.ok:
+            raise RuntimeError(f"download {m} {r.status_code}: {r.text[:300]}")
+    t0 = time.time()
+    while True:
+        rows = requests.get(f"{BASE}/models/status", timeout=60).json().get("models", [])
+        state = {row.get("model_name"): bool(row.get("downloaded")) for row in rows}
+        missing = [m for m in wanted if not state.get(m)]
+        if not missing:
+            return {"ok": True, "downloaded": wanted, "seconds": round(time.time() - t0, 1), "volume": VOL}
+        if time.time() - t0 > budget:
+            return {"ok": False, "still_downloading": missing, "seconds": round(time.time() - t0, 1),
+                    "hint": "run preload again; finished downloads are kept on the volume"}
+        time.sleep(10)
+
+
 def handler(job):
     inp = job.get("input") or {}
     op = inp.get("op", "speak")
+    # Every temp file of this job lives in one directory that is removed afterwards, so a warm
+    # worker never fills its disk. RunPod runs one job at a time per worker by default.
+    job_dir = tempfile.mkdtemp(prefix="job-")
+    tempfile.tempdir = job_dir
     try:
         start_server()
+        if op == "preload":
+            return preload(inp)
         if op == "health":
             return {"ok": True, "health": requests.get(f"{BASE}/health", timeout=10).json(), "volume": VOL}
         if op == "raw":
@@ -187,6 +222,9 @@ def handler(job):
         return {"error": f"unknown op {op}"}
     except Exception as e:  # report, never crash the worker
         return {"error": f"{type(e).__name__}: {str(e)[:600]}"}
+    finally:
+        tempfile.tempdir = None
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 runpod.serverless.start({"handler": handler})
