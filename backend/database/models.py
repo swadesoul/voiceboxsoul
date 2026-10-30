@@ -79,8 +79,8 @@ class Generation(Base):
     is_favorited = Column(Boolean, default=False)
     # Origin of this generation — "manual" for plain /generate calls,
     # "personality_speak" for rows whose text was rewritten through the
-    # profile's personality LLM before TTS. Future sources (bulk import,
-    # agent replies, etc.) can extend this.
+    # profile's personality LLM before TTS, "dub" for es/fr approval
+    # samples produced by POST /dub/sample.
     source = Column(String, nullable=False, default="manual")
     created_at = Column(DateTime, default=datetime.utcnow)
 

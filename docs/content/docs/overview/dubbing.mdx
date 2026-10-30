@@ -1,0 +1,162 @@
+---
+title: Dubbing samples
+description: Translate a transcript through OmniRoute and speak it in Spanish or French for caller approval.
+---
+
+Dubbing samples turn a transcript into Spanish or French audio so someone
+can approve the read before any production use.
+
+The path is fixed:
+
+1. Transcript text.
+2. OmniRoute translates it (`SWADE_AI_GATEWAY_URL` + `/v1/chat/completions`).
+3. Voicebox speaks the translation with `voicebox.speak`'s generation path,
+   language `es` or `fr`, and a voice profile you choose.
+
+Samples are tagged `purpose: "approval-sample"`. Personality rewrite is
+off, so the audio is the translation and not a second rewrite.
+
+Provider keys do not belong in the Voicebox environment. The server reads
+`SWADE_AI_GATEWAY_URL` and, optionally, `SWADE_AI_GATEWAY_STANDBY_URL`.
+It does not read or send `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or
+`XAI_API_KEY`. Those credentials stay on the OmniRoute host.
+
+## Pick a language
+
+| Code | Language | When to use |
+| --- | --- | --- |
+| `es` | Spanish | The caller asked for a Spanish read. |
+| `fr` | French | The caller asked for a French read. |
+
+Other language codes are rejected. Run both when the approval needs a
+pair of samples — the CLI does that by default.
+
+## Pick a voice profile
+
+A profile is a name or id from Voicebox (cloned voice or preset).
+
+```bash
+curl -s http://127.0.0.1:17493/profiles
+```
+
+Or, from an MCP client, `voicebox.list_profiles`. Pass the `name` as
+`profile`.
+
+Resolution matches `POST /speak`:
+
+1. `profile` on the request (name, case-insensitive, or id).
+2. The per-client binding for `X-Voicebox-Client-Id`.
+3. The default playback voice in Settings → MCP.
+
+The profile's engine has to speak the target language. English-only
+weights are rejected: LuxTTS, Chatterbox Turbo, and TADA 1B.
+
+| Engine | es / fr | Notes |
+| --- | --- | --- |
+| `qwen` | yes | Default size 1.7B. `0.6B` also speaks both. |
+| `qwen_custom_voice` | yes | Same sizes as Qwen. Designed voices, not clones. |
+| `chatterbox` | yes | Multilingual clone. One model size. |
+| `kokoro` | yes | Preset voices. Spanish: Dora (`ef_dora`), Alex (`em_alex`), Santa (`em_santa`). French: Siwis (`ff_siwis`). |
+| `tada` | yes, on 3B only | Dubbing selects TADA 3B unless you pass another size. TADA 1B is English-only and is rejected. |
+| `luxtts` | no | English only. |
+| `chatterbox_turbo` | no | English only. |
+
+Pass `engine` when the profile's default engine cannot dub. Example: a
+Qwen clone named Morgan works for both languages; a Kokoro preset named
+Dora is the Spanish voice, Siwis is the French voice. Use the matching
+preset for Kokoro, or one multilingual clone for both samples.
+
+The voice model weights still have to be downloaded in Voicebox
+(Settings → Models, or the first `/generate` for that engine). A missing
+model fails the sample after translation, with the engine name in the error.
+
+## Generate a sample
+
+Voicebox must be running (`http://127.0.0.1:17493`) and the server process
+needs the gateway:
+
+```bash
+export SWADE_AI_GATEWAY_URL=http://127.0.0.1:20128
+# optional, used only if the primary gateway errors or is unreachable
+export SWADE_AI_GATEWAY_STANDBY_URL=http://127.0.0.1:20129
+```
+
+Do not export `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `XAI_API_KEY` for
+this. If they are already set, Voicebox still does not send them.
+
+### CLI (es and fr files)
+
+From the repo root:
+
+```bash
+backend/venv/bin/python -m backend.dubbing \
+  --text "The deploy finished cleanly. Please approve this read." \
+  --profile Morgan \
+  --out-dir ./dub-samples
+```
+
+That command produces:
+
+- `dub-samples/sample-es.wav`
+- `dub-samples/sample-fr.wav`
+- `dub-samples/manifest.json` with the translation, generation id, and `audio_url` for each
+
+Send those wavs to the caller. Production dubbing waits on their approval.
+
+One language:
+
+```bash
+backend/venv/bin/python -m backend.dubbing \
+  --text-file ./transcript.txt \
+  --language es \
+  --profile Dora \
+  --engine kokoro \
+  --out-dir ./dub-samples
+```
+
+`--gateway-model` overrides OmniRoute's model id (the server default is
+`auto`). `--model-size 3B` is required only if you force TADA and want to
+be explicit. `--no-wait` returns the URLs without downloading audio.
+
+### HTTP
+
+```bash
+curl -s -X POST http://127.0.0.1:17493/dub/sample \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "The deploy finished cleanly. Please approve this read.",
+    "language": "es",
+    "profile": "Morgan"
+  }'
+```
+
+The JSON response includes `translated_text`, `generation_id`, `engine`,
+and `audio_url` (for example `http://127.0.0.1:17493/audio/<id>`). That
+URL is what you forward when the caller will fetch the audio themselves.
+
+`download=true` returns the wav body instead, once generation has finished:
+
+```bash
+curl -s -X POST 'http://127.0.0.1:17493/dub/sample?download=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Please approve this read.","language":"fr","profile":"Siwis"}' \
+  -o sample-fr.wav
+```
+
+`wait` defaults to true and `timeout_s` defaults to 180. History rows are
+stored with `source: "dub"`.
+
+## What has to be installed
+
+| Dependency | Where it lives | If it is missing |
+| --- | --- | --- |
+| OmniRoute (or another OpenAI-compatible gateway on `/v1/chat/completions`) | `SWADE_AI_GATEWAY_URL` | `POST /dub/sample` returns 503. Nothing is spoken. |
+| A model route inside OmniRoute (default request model is `auto`) | OmniRoute, not Voicebox | 502 with the gateway's error. Pass `model` / `--gateway-model` when `auto` is not configured. |
+| OmniRoute local access | OmniRoute | 401. Voicebox will not attach a provider key or a gateway bearer token. Allow the local client on the OmniRoute host. |
+| Standby gateway | `SWADE_AI_GATEWAY_STANDBY_URL` | Optional. Used when the primary is unreachable or returns 408, 425, 429, or 5xx. A 401 does not fail over. |
+| Multilingual TTS weights | Voicebox model cache for the chosen engine | Translation can succeed and TTS then fails (502) until the model is downloaded. |
+| Voice profile | Voicebox profile library | 404 if the name or id does not match. 400 if no profile and no default are set. |
+
+Local TTS still uses Voicebox's existing model cache and device setup
+(`VOICEBOX_MODELS_DIR`, MLX, CUDA, ROCm, or CPU). Dubbing does not add a
+cloud TTS key.
