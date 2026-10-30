@@ -20,6 +20,8 @@ from backend.mcp_server.context import _is_stamped_path
         "/mcp/bindings",  # admin REST; benign — frontend never sets the header
         "/speak",
         "/speak/",
+        "/dub",
+        "/dub/sample",
     ],
 )
 def test_mcp_semantic_paths_are_stamped(path: str) -> None:
@@ -41,6 +43,7 @@ def test_mcp_semantic_paths_are_stamped(path: str) -> None:
         # Prefix overlap should not match — /speakers is a hypothetical
         # future endpoint that shouldn't leak the stamp.
         "/speakers",
+        "/dubbing",
         # Same for anything starting with /mcpfoo.
         "/mcpfoo",
     ],

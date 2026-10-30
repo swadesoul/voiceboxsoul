@@ -140,6 +140,15 @@ async def update_generation_status(
     return GenerationResponse.model_validate(generation)
 
 
+async def set_generation_source(generation_id: str, source: str, db: Session) -> None:
+    """Record where a generation came from (for example ``dub`` approval samples)."""
+    generation = db.query(DBGeneration).filter_by(id=generation_id).first()
+    if generation is None:
+        return
+    generation.source = source
+    db.commit()
+
+
 async def get_generation(
     generation_id: str,
     db: Session,

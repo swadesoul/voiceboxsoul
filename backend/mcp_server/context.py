@@ -69,7 +69,8 @@ def request_is_loopback() -> bool:
 # - /speak — REST mirror of voicebox.speak for non-MCP agents (shell
 #   scripts, ACP, A2A). Uses the same per-client binding lookup, so its
 #   callers belong in the last-seen list too.
-_STAMPED_PATH_PREFIXES: tuple[str, ...] = ("/mcp", "/speak")
+# - /dub — approval-sample dubbing. Same profile resolution as /speak.
+_STAMPED_PATH_PREFIXES: tuple[str, ...] = ("/mcp", "/speak", "/dub")
 
 
 class ClientIdMiddleware(BaseHTTPMiddleware):

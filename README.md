@@ -306,6 +306,22 @@ curl http://127.0.0.1:17493/profiles
 
 `POST /speak` accepts `profile` as a name (case-insensitive) or id, and resolves via the same precedence as the MCP tool: explicit arg → per-client binding → `capture_settings.default_playback_voice_id`.
 
+### Dubbing samples (Spanish and French)
+
+`POST /dub/sample` translates a transcript through OmniRoute, then speaks it with the same path as `voicebox.speak` in `es` or `fr`. The response is an approval sample (`audio_url` plus a wav download) to send to the caller before any production dub.
+
+The Voicebox process needs `SWADE_AI_GATEWAY_URL` (optional failover: `SWADE_AI_GATEWAY_STANDBY_URL`). It does not read `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `XAI_API_KEY` — those stay on the OmniRoute host.
+
+```bash
+# Voicebox on :17493, gateway exported in the server environment.
+backend/venv/bin/python -m backend.dubbing \
+  --text "The deploy finished cleanly. Please approve this read." \
+  --profile Morgan \
+  --out-dir ./dub-samples
+```
+
+That writes `dub-samples/sample-es.wav`, `dub-samples/sample-fr.wav`, and a `manifest.json`. How to choose a profile and which engines speak `es` / `fr` is in [Dubbing samples](docs/content/docs/overview/dubbing.mdx).
+
 ### MCP server
 
 Voicebox ships a built-in **Model Context Protocol** server so any MCP-aware agent (Claude Code, Cursor, Windsurf, Cline, VS Code MCP extensions) can speak, transcribe, and browse captures and profiles.

@@ -806,6 +806,59 @@ class CloudLoginStartResponse(BaseModel):
     authorize_url: str
 
 
+class DubSampleRequest(BaseModel):
+    """Body for POST /dub/sample — translate, then speak, for caller approval."""
+
+    text: str = Field(..., min_length=1, max_length=10000)
+    language: str = Field(
+        ...,
+        pattern="^(es|fr)$",
+        description="Target dub language. es = Spanish, fr = French.",
+    )
+    profile: Optional[str] = Field(
+        None,
+        description="Voice profile name or id. Falls back to the per-client binding, then the default.",
+    )
+    engine: Optional[str] = Field(
+        None,
+        pattern="^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$",
+        description="TTS engine override. Must support es/fr (not LuxTTS, Chatterbox Turbo, or TADA 1B).",
+    )
+    model_size: Optional[str] = Field(
+        None,
+        pattern="^(1\\.7B|0\\.6B|1B|3B)$",
+        description="Optional size. TADA dubbing needs 3B. Qwen defaults to 1.7B.",
+    )
+    model: Optional[str] = Field(
+        None,
+        max_length=200,
+        description="OmniRoute model id sent to /v1/chat/completions. Defaults to auto.",
+    )
+    wait: bool = Field(
+        default=True,
+        description="When true, block until TTS finishes so audio_url is ready to send.",
+    )
+    timeout_s: float = Field(default=180, ge=1, le=600)
+
+
+class DubSampleResponse(BaseModel):
+    """An approval sample. Send audio_url (or the wav) to the caller before production use."""
+
+    language: str
+    profile_id: str
+    profile_name: str
+    engine: str
+    model_size: Optional[str] = None
+    source_text: str
+    translated_text: str
+    generation_id: str
+    status: str
+    audio_url: str
+    poll_url: str
+    audio_path: Optional[str] = None
+    purpose: str = "approval-sample"
+
+
 class CloudStatusResponse(BaseModel):
     """Current link between this device and a Voicebox Cloud account."""
 
